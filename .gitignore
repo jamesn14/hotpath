@@ -1,6 +1,6 @@
 # Prerequisites
 *.d
-
+CLAUDE.md
 # Compiled Object files
 *.slo
 *.lo
