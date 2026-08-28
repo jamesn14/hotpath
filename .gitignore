@@ -11,6 +11,9 @@ CLAUDE.md
 *.gch
 *.pch
 
+IDE files
+.idea/
+
 # Linker files
 *.ilk
 
