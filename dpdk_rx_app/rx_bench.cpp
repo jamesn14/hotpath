@@ -2,7 +2,6 @@
 // Created by jamesn on 9/3/26.
 //
 
-#include "rx_bench.h"
 
 #include <vector>
 
@@ -35,6 +34,18 @@ void print_percentiles(const char* label, std::vector<uint64_t>& cycles, double 
 
 double measure_ns_per_cycle() {
     return 1e9 / (rte_get_tsc_hz());
+}
+
+void export_csv(const char* path, std::vector<uint64_t>& cycles, double ns_per_cycle) {
+    FILE* f = std::fopen(path, "w");
+    if (!f) {
+        std::perror("fopen");
+        return;
+    }
+    for (uint64_t c : cycles) {
+        std::fprintf(f, "%.1f\n", c * ns_per_cycle);
+    }
+    std::fclose(f);
 }
 
 int add_pkt_metadata() {
@@ -110,8 +121,8 @@ int read_from_ring(void* arg) {
             uint64_t start_time = metadata->ts;
             if (processed >= warmupIterations)
                 cycles[processed - warmupIterations] = end_time - start_time;
-            rte_pktmbuf_free(rx_pkts[p]);
         }
+        rte_pktmbuf_free_bulk(rx_pkts, popped);
         // static uint64_t next_print = 10000;
         // if (processed >= next_print) {
         //     std::printf("processed: %lu / %lu\n", processed, numIterations);
@@ -145,4 +156,5 @@ int main(int argc, char** argv) {
     read_from_nic(&ring, numIterations, tsc_offset);
     rte_eal_wait_lcore(1);
     print_percentiles("rx_bench round-trip",cycles, ns_per_cycle);
+    export_csv("rx_bench_latencies.csv", cycles, ns_per_cycle);
 }
