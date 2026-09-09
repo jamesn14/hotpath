@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -115,16 +116,13 @@ void receive_loop(int sock, Pipeline* p, uint64_t numIterations) {
     struct iovec iovecs[kBurstSize];
 
     while (processed < numIterations) {
-        std::size_t got = 0;
-        while (got < kBurstSize && p->free_ring.try_pop(batch[got])) {
-            got++;
-        }
+        std::size_t got = p->free_ring.try_pop_batch(std::span(batch, kBurstSize));
         if (got == 0) {
             std::this_thread::yield();
             continue;
         }
 
-        std::memset(msgs, 0, sizeof(msgs));
+        std::memset(msgs, 0, got * sizeof(msgs[0]));
         for (std::size_t i = 0; i < got; i++) {
             iovecs[i].iov_base = batch[i]->data;
             iovecs[i].iov_len = kMaxFrameSize;
@@ -134,9 +132,9 @@ void receive_loop(int sock, Pipeline* p, uint64_t numIterations) {
 
         int n = recvmmsg(sock, msgs, static_cast<unsigned int>(got), MSG_WAITFORONE, nullptr);
         if (n <= 0) {
-            for (std::size_t i = 0; i < got; i++) {
-                while (!p->free_ring.try_push(batch[i])) {
-                }
+            std::size_t returned = 0;
+            while (returned < got) {
+                returned += p->free_ring.try_push_batch(std::span(batch).subspan(returned, got - returned));
             }
             continue;
         }
@@ -145,12 +143,17 @@ void receive_loop(int sock, Pipeline* p, uint64_t numIterations) {
         for (int i = 0; i < n; i++) {
             batch[i]->ts = ts;
             batch[i]->len = static_cast<uint16_t>(msgs[i].msg_len);
-            while (!p->rx_ring.try_push(batch[i])) {
-                std::this_thread::yield();
-            }
         }
-        for (std::size_t i = static_cast<std::size_t>(n); i < got; i++) {
-            while (!p->free_ring.try_push(batch[i])) {
+        std::size_t pushed = 0;
+        std::size_t n_unsigned = static_cast<std::size_t>(n);
+        while (pushed < n_unsigned) {
+            pushed += p->rx_ring.try_push_batch(std::span(batch).subspan(pushed, n_unsigned - pushed));
+        }
+        if (n_unsigned < got) {
+            std::size_t leftover = got - n_unsigned;
+            std::size_t returned = 0;
+            while (returned < leftover) {
+                returned += p->free_ring.try_push_batch(std::span(batch).subspan(n_unsigned + returned, leftover - returned));
             }
         }
         processed += static_cast<uint64_t>(n);
@@ -199,6 +202,30 @@ void consume_loop(Pipeline* p, std::vector<uint64_t>* latencies_ns, uint64_t num
     }
 }
 
+void consume_loop_batch(Pipeline* p, std::vector<uint64_t>* latencies_ns, uint64_t numIterations,
+                         uint64_t warmupIterations) {
+    pin_self_to_core(1);
+    uint64_t processed = 0;
+    Packet* batch[kBurstSize];
+    while (processed < numIterations) {
+        std::size_t popped = p->rx_ring.try_pop_batch(std::span(batch, kBurstSize));
+        if (popped == 0) {
+            std::this_thread::yield();
+            continue;
+        }
+        uint64_t end_time = now_ns();
+        for (std::size_t i = 0; i < popped && processed < numIterations; i++, processed++) {
+            if (processed >= warmupIterations) {
+                (*latencies_ns)[processed - warmupIterations] = end_time - batch[i]->ts;
+            }
+        }
+        std::size_t pushed = 0;
+        while (pushed < popped) {
+            pushed += p->free_ring.try_push_batch(std::span(batch).subspan(pushed, popped - pushed));
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -225,10 +252,12 @@ int main(int argc, char** argv) {
 
     std::vector<uint64_t> latencies_ns(numIterations - warmupIterations);
 
-    std::thread consumer(consume_loop, pipeline.get(), &latencies_ns, numIterations, warmupIterations);
+    std::thread consumer;
     if (mode == "single") {
+        consumer = std::thread(consume_loop, pipeline.get(), &latencies_ns, numIterations, warmupIterations);
         receive_loop_single(sock, pipeline.get(), numIterations);
     } else {
+        consumer = std::thread(consume_loop_batch, pipeline.get(), &latencies_ns, numIterations, warmupIterations);
         receive_loop(sock, pipeline.get(), numIterations);
     }
     consumer.join();
