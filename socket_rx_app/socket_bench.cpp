@@ -27,6 +27,7 @@ namespace {
 constexpr std::size_t kMaxFrameSize = 2048;
 constexpr std::size_t kPoolSize = 4096;
 constexpr std::size_t kBurstSize = 32;
+constexpr std::size_t kRecvVlen = 32;
 
 struct Packet {
     uint64_t ts;
@@ -71,7 +72,7 @@ void pin_self_to_core(int core) {
     CPU_SET(core, &cpuset);
     int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
     if (rc != 0) {
-        std::fprintf(stderr, "warning: failed to pin thread to core %d (rc=%d)\n", core, rc);
+        std::fprintf(stderr, "g: failed to pin thread to core %d (rc=%d)\n", core, rc);
     }
 }
 
@@ -80,6 +81,11 @@ int open_raw_socket(const char* ifname) {
     if (sock < 0) {
         perror("socket");
         std::exit(EXIT_FAILURE);
+    }
+
+    int rcvbuf_size = 8 * 1024 * 1024;  // 8 MB, well above the observed flood rate
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf_size, sizeof(rcvbuf_size)) < 0) {
+        perror("setsockopt(SO_RCVBUFFORCE)");
     }
 
     struct ifreq ifr {};
@@ -116,7 +122,7 @@ void receive_loop(int sock, Pipeline* p, uint64_t numIterations) {
     struct iovec iovecs[kBurstSize];
 
     while (processed < numIterations) {
-        std::size_t got = p->free_ring.try_pop_batch(std::span(batch, kBurstSize));
+        std::size_t got = p->free_ring.try_pop_batch(std::span(batch, kRecvVlen));
         if (got == 0) {
             std::this_thread::yield();
             continue;
@@ -261,6 +267,14 @@ int main(int argc, char** argv) {
         receive_loop(sock, pipeline.get(), numIterations);
     }
     consumer.join();
+
+    struct tpacket_stats pkt_stats {};
+    socklen_t stats_len = sizeof(pkt_stats);
+    if (getsockopt(sock, SOL_PACKET, PACKET_STATISTICS, &pkt_stats, &stats_len) == 0) {
+        std::printf("DROP_STATS received=%u dropped=%u\n", pkt_stats.tp_packets, pkt_stats.tp_drops);
+    } else {
+        perror("getsockopt(PACKET_STATISTICS)");
+    }
 
     close(sock);
     std::string label = "socket round-trip (" + mode + ")";

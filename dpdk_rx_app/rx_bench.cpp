@@ -155,6 +155,12 @@ int main(int argc, char** argv) {
     rte_eal_remote_launch(read_from_ring, &consumer_arg, 1);
     read_from_nic(&ring, numIterations, tsc_offset);
     rte_eal_wait_lcore(1);
+
+    struct rte_eth_stats stats;
+    rte_eth_stats_get(0, &stats);
+    std::printf("DROP_STATS received=%lu dropped=%lu (imissed=%lu rx_nombuf=%lu ierrors=%lu)\n",
+                stats.ipackets, stats.imissed + stats.rx_nombuf, stats.imissed, stats.rx_nombuf, stats.ierrors);
+
     print_percentiles("rx_bench round-trip",cycles, ns_per_cycle);
     export_csv("rx_bench_latencies.csv", cycles, ns_per_cycle);
 }
