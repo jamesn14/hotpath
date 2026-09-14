@@ -60,5 +60,15 @@ numbers we get a different story between the two implementations.
 | After Avg | — | — | ~36.7%                                  |  
 
 ### recv() vs recvmmsg()
-
+What we see in these numbers from the latency by percentile is a couple of things:
+1. recv (single) sees more raw offered packets in absolute terms because it's throughput-limited (one packet per call), so it takes longer in total time to execute
+the 95,000 iteration run. This means over the duration of the run, more packets are seen and dropped.
+2. Of this greater number of packets sent during the run, the percentage dropped by the recv (single) is more still compared to recvmmsg (batch). We can see that 
+around 6% more were delivered by the recvmmsg runs.
+3. If we set vlen to 1 in the recvmmsg() parameters we get these numbers: \
+vlen=1 batch p50 values (10 runs): 780, 780, 790, 790, 780, 780, 790, 790, 780, 790 → average ≈ 785ns \
+vlen=1 batch p99 values: 1140, 1180, 1320, 1300, 1250, 1130, 1130, 1220, 1250, 1130 → average ≈ 1205ns \
+Single recv() pooled (n=950,000): p50=780ns, p99=1,180ns \
+This is interesting because we can see this pulls the batched number right inline with the single socket p50 and p99 numbers. There is real overhead added by using 
+recvmmsg as it has to allocate and copy the mmsghdr struct that recv doesn't. The difference this adds is not detectable with our noise floor.
 ## Local Setup
