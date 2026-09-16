@@ -121,6 +121,10 @@ void receive_loop(int sock, Pipeline* p, uint64_t numIterations) {
     struct mmsghdr msgs[kBurstSize];
     struct iovec iovecs[kBurstSize];
 
+    uint64_t n_histogram[kBurstSize + 1] = {};
+    uint64_t recvmmsg_calls = 0;
+    std::size_t max_rx_ring_occupancy = 0;
+
     while (processed < numIterations) {
         std::size_t got = p->free_ring.try_pop_batch(std::span(batch, kRecvVlen));
         if (got == 0) {
@@ -145,6 +149,9 @@ void receive_loop(int sock, Pipeline* p, uint64_t numIterations) {
             continue;
         }
 
+        recvmmsg_calls++;
+        n_histogram[n]++;
+
         uint64_t ts = now_ns();
         for (int i = 0; i < n; i++) {
             batch[i]->ts = ts;
@@ -155,6 +162,7 @@ void receive_loop(int sock, Pipeline* p, uint64_t numIterations) {
         while (pushed < n_unsigned) {
             pushed += p->rx_ring.try_push_batch(std::span(batch).subspan(pushed, n_unsigned - pushed));
         }
+        max_rx_ring_occupancy = std::max(max_rx_ring_occupancy, p->rx_ring.size());
         if (n_unsigned < got) {
             std::size_t leftover = got - n_unsigned;
             std::size_t returned = 0;
@@ -164,11 +172,21 @@ void receive_loop(int sock, Pipeline* p, uint64_t numIterations) {
         }
         processed += static_cast<uint64_t>(n);
     }
+
+    std::printf("N_DIST calls=%lu", recvmmsg_calls);
+    for (std::size_t i = 1; i <= kBurstSize; i++) {
+        if (n_histogram[i] > 0) {
+            std::printf(" n%zu=%lu", i, n_histogram[i]);
+        }
+    }
+    std::printf("\n");
+    std::printf("RING_STATS max_rx_ring_occupancy=%zu capacity=%zu\n", max_rx_ring_occupancy, p->rx_ring.capacity());
 }
 
 void receive_loop_single(int sock, Pipeline* p, uint64_t numIterations) {
     pin_self_to_core(0);
     uint64_t processed = 0;
+    std::size_t max_rx_ring_occupancy = 0;
     while (processed < numIterations) {
         Packet* pkt;
         while (!p->free_ring.try_pop(pkt)) {
@@ -185,8 +203,10 @@ void receive_loop_single(int sock, Pipeline* p, uint64_t numIterations) {
         while (!p->rx_ring.try_push(pkt)) {
             std::this_thread::yield();
         }
+        max_rx_ring_occupancy = std::max(max_rx_ring_occupancy, p->rx_ring.size());
         processed++;
     }
+    std::printf("RING_STATS max_rx_ring_occupancy=%zu capacity=%zu\n", max_rx_ring_occupancy, p->rx_ring.capacity());
 }
 
 void consume_loop(Pipeline* p, std::vector<uint64_t>* latencies_ns, uint64_t numIterations,
@@ -258,6 +278,7 @@ int main(int argc, char** argv) {
 
     std::vector<uint64_t> latencies_ns(numIterations - warmupIterations);
 
+    uint64_t run_start = now_ns();
     std::thread consumer;
     if (mode == "single") {
         consumer = std::thread(consume_loop, pipeline.get(), &latencies_ns, numIterations, warmupIterations);
@@ -267,6 +288,8 @@ int main(int argc, char** argv) {
         receive_loop(sock, pipeline.get(), numIterations);
     }
     consumer.join();
+    uint64_t run_end = now_ns();
+    std::printf("RUN_DURATION ns=%lu seconds=%.3f\n", run_end - run_start, (run_end - run_start) / 1e9);
 
     struct tpacket_stats pkt_stats {};
     socklen_t stats_len = sizeof(pkt_stats);

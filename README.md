@@ -7,7 +7,8 @@ We are using two QEMU virtual machines to benchmark the pipeline. The first virt
 to the MAC address of the second VM. The second VM has two threads running where one thread is constantly consuming from the NIC and
 pushing those packets read straight to the SPSC queue. The other thread then pops from the SPSC queue and reads the start time from
 those packets to get the latency from getting the packet on the NIC to popping it from the queue and the data being usable. We use rdtsc
-counter to see how many CPU cycles it takes. By taking the inverse of the counters frequency we get the time taken in seconds per cycle.
+counter to see how many CPU cycles it takes for the DPDK path. The socket implemenations call clock_gettime(CLOCK_MONOTONIC_RAW) directly. 
+By taking the inverse of the counters frequency we get the time taken in seconds per cycle.
 Multiplying this by 1e9 gives us the time taken in ns. There are three pipelines we are comparing. 
 - The one we expect to perform the best is the DPDK kernel bypass pipeline that uses a busy polling approach to read from the NIC. It is using rte_eth_rx_burst to read batches/bursts
 of packets from the NIC. These are then pushed as a batch to the SPSC ring and popped from the ring as a batch.
@@ -35,6 +36,13 @@ If the buffer is empty after step 3 **additionally**:
 3. The thread is woken up and rescheduled once network softirq finishes with packet
 4. Resume on step 4 from above
 
+We are able to skip this using DPDK. The NIC driver is running in userspace using vfio, and the packets are transferred from the NIC via direct memory access (DMA) into the 
+ring of descriptors fed into the queue created with rte_eth_rx_queue_setup. When we call rte_eth_rx_burst() we aren't performing a syscall, it just reads the descriptor rings
+that have already been written by the NIC. We are skipping the interrupt, context switch, copy, and thread descheduling (while waiting for something to come).
+This explains why DPDK is so awesome here. There is an inherent tradeoff we see between the recv()/recvmmsg() implementations. They either have a low discovery latency, but
+have to pay the cost of the syscall each time OR have less syscalls via batching with the con of earlier packets in each batch being stale. rte_eth_rx_burst doesn't have this
+cost to deal with; So it can read from the nic constantly in a busy poll loop to get fast discovery latency, while also picking up many packets per call. It doesn't have to 
+choose one.
 
 ### Packet Loss
 Now when we compare the two socket based implementation's we have to note something interesting. When I first ran the numbers with
@@ -71,4 +79,21 @@ vlen=1 batch p99 values: 1140, 1180, 1320, 1300, 1250, 1130, 1130, 1220, 1250, 1
 Single recv() pooled (n=950,000): p50=780ns, p99=1,180ns \
 This is interesting because we can see this pulls the batched number right inline with the single socket p50 and p99 numbers. There is real overhead added by using 
 recvmmsg as it has to allocate and copy the mmsghdr struct that recv doesn't. The difference this adds is not detectable with our noise floor.
+
+| Config | Wall-clock duration | recvmmsg calls/run | % calls returning full batch | Max `rx_ring` occupancy (of 4096) |
+|---|---|---|---|---|
+| Batch, vlen=32 | 0.385s – 2.222s (avg ≈0.59s) | ~3,125 | ~100% (n=32 nearly every call) | 32–64 typical, one run hit 1,632 |
+| Batch, vlen=1 | 0.919s – 1.009s (avg ≈0.96s) | 100,000 | 100% (forced, n=1 capped) | 2–45 |
+| Single recv() | 0.758s – 0.841s (avg ≈0.80s) | N/A (not recvmmsg) | N/A | 3–52 |
+
+4. When we ran with the number of elements received from each recvmmsg() call we saw that actually basically always we were pulling 32 elements. What this means is that batching
+was being fully utilized but vlen(32) was slower than vlen(1) per packet. That could either the extra cost of the recvmmsg() overhead that scales with vlen or it could be
+just an artifact of how we are recording per packet. Even though we are seeing a worse per-packet latency, vlen=32 finishes the run in half the wall clock duration. This is
+because there are fewer recvmmsg() calls for the same work, which is the batching tradeoff we make: better aggregate throughput, but worse per packet latency.
+5. The p99.9 and max latency numbers are in large millisecond ranges that we also see in the DPDK bench. We have determined they aren't rx_ring occupancy by the table above
+as those outliers still exist with rx_ring occupancy very low relative to its total size. This means there's no pressure filling up the rx_ring causing latency spikes. Some of it
+we were able to trace to the host CPU scheduling underlying these vCPUs. Running perf sched trace we found a max delay of 2.6ms, which is only part of the 7ms we were tending to see.
+The max and p99.9 numbers are being heavily affected by noise in the test environment ie don't have core isolation configured on the host. We have configured the vCPU's threads to only run on those cores, but
+we haven't done anything to prevent the OS from scheduling other things its wants on those cores.
+For comparing recv, dpdk and recvmmsg, use the p50 and p99 numbers as the reliable comparison.
 ## Local Setup
