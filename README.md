@@ -97,3 +97,231 @@ The max and p99.9 numbers are being heavily affected by noise in the test enviro
 we haven't done anything to prevent the OS from scheduling other things its wants on those cores.
 For comparing recv, dpdk and recvmmsg, use the p50 and p99 numbers as the reliable comparison.
 ## Local Setup
+**Create the isolated network:**
+
+```bash
+cat > pktgen-isolated.xml <<'EOF'
+<network>
+<name>pktgen-isolated</name>
+<bridge name='virbr-pktgen' stp='off' delay='0'/>
+</network>
+EOF
+sudo virsh net-define pktgen-isolated.xml
+sudo virsh net-start pktgen-isolated
+sudo virsh net-autostart pktgen-isolated
+```
+
+This is a private, direct wire without NAT, this is to remove the noise of other things going on my computers default network
+
+### QEMU Setup:
+
+**Install command:**
+
+`sudo pacman -S qemu-full libvirt virt-manager dnsmasq edk2-ovmf
+`
+
+**Enable libvrt daemon:**
+
+`sudo systemctl enable --now libvirtd.service
+`
+
+Add your user to the libvirt and kvm groups so you can manage VMs and access /dev/kvm without sudo:
+
+`sudo usermod -aG libvirt,kvm $USER
+`
+
+**Validate:**
+
+`virt-host-validate qemu
+`
+
+**Login:**
+
+**1. From your host terminal (not inside the VM), run:**
+
+```bash
+   virt-install \
+   --name dpdk-vm \
+   --memory 4096 \
+   --vcpus 2 \
+   --disk size=20 \
+   --cdrom /var/lib/libvirt/images/ubuntu-26.04-live-server-amd64.iso \
+   --os-variant ubuntu24.04 \
+   --network network=default,model=virtio \
+   --graphics spice
+```
+`sudo virsh net-dhcp-leases default
+`
+
+**2. Confirm you see an IP for dpdk-vm, then SSH in from the host:**
+
+`ssh <your-username>@<that-ip>
+`
+
+**3. Once that SSH session works, close the virt-viewer window**
+
+**Run in the VM:**
+
+```bash
+sudo apt update && sudo apt install -y \
+git build-essential meson ninja-build python3-pyelftools \
+libnuma-dev pkg-config
+```
+**What each piece is for:**
+
+- build-essential — gcc/g++/make, the basic C/C++ toolchain DPDK needs to compile.
+- meson + ninja-build — DPDK switched its build system to Meson+Ninja years ago (no more make config && make like old versions); this is what actually drives the DPDK build.
+- python3-pyelftools — DPDK's build scripts use this to inspect compiled binaries (symbol/ELF section analysis) as part of the build process.
+- libnuma-dev — DPDK is NUMA-aware (it cares which memory node a core's traffic lives on) even though your VM is single-socket/no real NUMA; the library headers are still a hard build dependency.
+- pkg-config — standard Linux convention for libraries to advertise their compile/link flags; DPDK both consumes and provides .pc files.
+- git — to actually clone the DPDK source repo, which we'll do next.
+
+**Allocate the hugepages**
+
+```bash
+echo 1024 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+grep Huge /proc/meminfo
+```
+
+Attach the second NIC:
+
+```bash
+virsh -c qemu:///system attach-interface \
+  --domain dpdk-vm \
+  --type network \
+  --source pktgen-isolated \
+  --model virtio \
+  --config --live
+```
+**Then rebind the NIC:**
+```bash
+cd ~/dpdk
+sudo modprobe vfio_pci
+echo Y | sudo tee /sys/module/vfio/parameters/enable_unsafe_noiommu_mode
+sudo ./usertools/dpdk-devbind.py --bind=vfio-pci 0000:07:00.0 --force
+./usertools/dpdk-devbind.py --status
+```
+**Build DPDK:**
+```bash
+git clone https://github.com/DPDK/dpdk.git ~/dpdk
+cd ~/dpdk
+meson setup builddir
+ninja -C builddir
+sudo ninja -C builddir install
+sudo ldconfig
+```
+
+### Pktgen VM Setup
+
+1. Create pktgen-vm:
+   ```bash
+    virt-install \
+    --name pktgen-vm \
+    --memory 4096 \
+    --vcpus 2 \
+    --disk size=20 \
+    --cdrom /var/lib/libvirt/images/ubuntu-26.04-live-server-amd64.iso \
+    --os-variant ubuntu24.04 \
+    --network network=default,model=virtio \
+    --graphics spice
+
+    sudo virsh net-dhcp-leases default
+    ```
+2. Attach the second NIC:
+
+    ```bash
+    virsh -c qemu:///system attach-interface \
+   --domain pktgen-vm \
+   --type network \
+   --source pktgen-isolated \
+   --model virtio \
+   --config --live
+    ```
+3. SSH in, then install the same DPDK build deps as dpdk-vm:
+
+    ```bash
+   sudo apt update && sudo apt install -y \
+   git build-essential meson ninja-build python3-pyelftools \
+   libnuma-dev pkg-config
+    ```
+4. Allocate hugepages (identical to dpdk-vm):
+
+    ```bash
+   echo 1024 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+   grep Huge /proc/meminfo
+    ```
+5. Build DPDK 
+    ```bash
+   git clone https://github.com/DPDK/dpdk.git ~/dpdk
+   cd ~/dpdk
+   meson setup builddir
+   ninja -C builddir
+   sudo ninja -C builddir install
+   sudo ldconfig
+    ```
+6. Clone and build Pktgen-DPDK: 
+    ```bash
+   git clone https://github.com/pktgen/Pktgen-DPDK.git ~/Pktgen-DPDK
+   cd ~/Pktgen-DPDK
+   meson setup builddir
+   ninja -C builddir
+    ```
+7. Bind the NIC to vfio-pci (same as dpdk-vm):
+    ```bash
+   sudo modprobe vfio_pci
+   echo Y | sudo tee /sys/module/vfio/parameters/enable_unsafe_noiommu_mode
+   cd ~/dpdk
+   sudo ./usertools/dpdk-devbind.py --bind=vfio-pci 0000:07:00.0 --force
+   ./usertools/dpdk-devbind.py --status
+    ```
+8. Run it:
+    ```bash
+   cd ~/Pktgen-DPDK
+   sudo ./builddir/app/pktgen -l 0,1 -n 4 -a 0000:07:00.0 -- -P -T -m "1.0"
+    ```
+   
+**In DPDK VM Clone hotpath:**
+
+```bash
+git clone https://github.com/jamesn14/hotpath ~/hotpath
+```
+Build rx_bench:
+
+```bash
+cd ~/hotpath/dpdk_rx_app
+cmake -B cmake-build-dpdk-vm
+cmake --build cmake-build-dpdk-vm --target rx_bench
+```
+Build socket_bench:
+
+```bash
+cd ~/hotpath/socket_rx_app
+cmake -B cmake-build-dpdk-vm
+cmake --build cmake-build-dpdk-vm --target socket_bench
+```
+`rx_bench` needs the NIC on `vfio-pci`:
+
+```bash
+sudo dpdk-devbind.py --bind=vfio-pci 0000:07:00.0
+cd ~/hotpath/dpdk_rx_app/cmake-build-dpdk-vm
+sudo ./rx_bench -l 0,1 -n 4 -a 0000:07:00.0 -- 5000 100000
+```
+
+`socket_bench` needs the NIC on `virtio-pci`:
+```bash
+sudo dpdk-devbind.py --bind=virtio-pci 0000:07:00.0
+cd ~/hotpath/socket_rx_app/cmake-build-dpdk-vm
+sudo ./socket_bench enp7s0 5000 100000 single
+sudo ./socket_bench enp7s0 5000 100000 batch
+```
+If you want to run the versions that pool over 10 runs do use these instead
+```bash
+~/hotpath/scripts/run_repeated.sh 10 rx_bench_latencies.csv runs/rx_bench -- sudo ./rx_bench -l 0,1 -n 4 -a 0000:07:00.0 -- 5000 100000
+```
+```bash
+~/hotpath/scripts/run_repeated.sh 10 socket_bench_batch_latencies.csv runs/socket_batch -- sudo ./socket_bench enp7s0 5000 100000 batch
+```
+```bash
+~/hotpath/scripts/run_repeated.sh 10 socket_bench_single_latencies.csv runs/socket_single -- sudo ./socket_bench enp7s0 5000 100000 single
+```
+If you do that pull the csv files into analysis/runs and run `python3 plot_latencies.py`
