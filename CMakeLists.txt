@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 4.1)
+cmake_minimum_required(VERSION 4.0.2)
 project(hotpath)
 
 set(CMAKE_CXX_STANDARD 23)
@@ -11,6 +11,21 @@ add_executable(hotpath main.cpp)
 # Interface library so the include path flows to all consumers.
 add_library(spsc_ring INTERFACE)
 target_include_directories(spsc_ring INTERFACE ${CMAKE_SOURCE_DIR}/include)
+
+# Compiles the portable headers on every platform and gives CLion a target that
+# owns the transport headers, so their hotpath/ includes resolve on macOS too.
+add_library(hotpath_headers STATIC
+        test/header_check.cpp
+        include/hotpath/receiver_base.h
+        include/hotpath/consumer_base.h
+        include/hotpath/rx_mode.h
+        include/hotpath/dpdk/dpdk_common.h
+        include/hotpath/dpdk/dpdk_receiver.h
+        include/hotpath/dpdk/dpdk_consumer.h
+        include/hotpath/socket/socket_common.h
+        include/hotpath/socket/socket_receiver.h
+        include/hotpath/socket/socket_consumer.h)
+target_link_libraries(hotpath_headers PRIVATE spsc_ring)
 
 # GTest - pulled at configure time, no system package needed.
 FetchContent_Declare(
@@ -44,4 +59,10 @@ if (HOTPATH_TSAN)
     target_link_options(ring_bench PRIVATE -fsanitize=thread)
     target_compile_options(spsc_ring_stress_test PRIVATE -fsanitize=thread -g -O1)
     target_link_options(spsc_ring_stress_test PRIVATE -fsanitize=thread)
+endif ()
+
+# AF_PACKET sockets and DPDK are Linux-only.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_subdirectory(socket_rx_app)
+    add_subdirectory(dpdk_rx_app)
 endif ()
