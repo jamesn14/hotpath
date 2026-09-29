@@ -19,14 +19,14 @@ private:
         return out.size();
     }
     std::size_t receive(std::span<rte_mbuf*> bufs){
-        uint16_t pkts_received = rte_eth_rx_burst(port_, queue_, bufs.data(), kDpdkBurst);
+        uint16_t pkts_received = rte_eth_rx_burst(port_, queue_, bufs.data(), bufs.size());
         return pkts_received;
     }
     void release(std::span<rte_mbuf*>) {};
     void stamp(std::span<rte_mbuf*> bufs) {
         uint64_t ts = rte_rdtsc_precise();
         for (rte_mbuf* buf : bufs) {
-            auto* metadata = (RTE_MBUF_DYNFIELD(bufs[p], tsc_offset_, pkt_details*));
+            auto* metadata = (RTE_MBUF_DYNFIELD(buf, tsc_offset_, pkt_details*));
             metadata->ts = ts;
         }
     }

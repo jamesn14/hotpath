@@ -12,8 +12,15 @@ add_executable(hotpath main.cpp)
 add_library(spsc_ring INTERFACE)
 target_include_directories(spsc_ring INTERFACE ${CMAKE_SOURCE_DIR}/include)
 
-# Compiles the portable headers on every platform and gives CLion a target that
-# owns the transport headers, so their hotpath/ includes resolve on macOS too.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(DPDK REQUIRED IMPORTED_TARGET libdpdk)
+
+# Compiles every header under include/hotpath/ (the shared CRTP bases plus the
+# DPDK and socket backends) as one translation unit, so the Build button gives
+# real compiler diagnostics and CLion's symbol resolution works for them, even
+# before any app target actually uses the new classes. Requires DPDK, so this
+# only configures under a toolchain that has it (e.g. the DPDK-VM remote
+# profile) -- same constraint dpdk_rx_app/rx_bench already have.
 add_library(hotpath_headers STATIC
         test/header_check.cpp
         include/hotpath/receiver_base.h
@@ -25,7 +32,7 @@ add_library(hotpath_headers STATIC
         include/hotpath/socket/socket_common.h
         include/hotpath/socket/socket_receiver.h
         include/hotpath/socket/socket_consumer.h)
-target_link_libraries(hotpath_headers PRIVATE spsc_ring)
+target_link_libraries(hotpath_headers PRIVATE spsc_ring PkgConfig::DPDK)
 
 # GTest - pulled at configure time, no system package needed.
 FetchContent_Declare(
