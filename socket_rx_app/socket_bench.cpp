@@ -1,6 +1,12 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
-#include "hotpath/spsc_ring.h"
+#include "hotpath/bench/latency_recorder.h"
+#include "hotpath/rx_mode.h"
+#include "hotpath/socket/socket_common.h"
+#include "hotpath/socket/socket_consumer.h"
+#include "hotpath/socket/socket_receiver.h"
 
 #include <arpa/inet.h>
 #include <linux/if_packet.h>
@@ -17,23 +23,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
-#include <span>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace {
-
-constexpr std::size_t kMaxFrameSize = 2048;
-constexpr std::size_t kPoolSize = 4096;
-constexpr std::size_t kBurstSize = 32;
-constexpr std::size_t kRecvVlen = 32;
-
-struct Packet {
-    uint64_t ts;
-    uint16_t len;
-    uint8_t data[kMaxFrameSize];
-};
 
 void print_percentiles(const char* label, std::vector<uint64_t>& latencies_ns) {
     std::sort(latencies_ns.begin(), latencies_ns.end());
@@ -60,19 +54,13 @@ void export_csv(const char* path, std::vector<uint64_t>& latencies_ns) {
     std::fclose(f);
 }
 
-uint64_t now_ns() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-    return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ull + static_cast<uint64_t>(ts.tv_nsec);
-}
-
 void pin_self_to_core(int core) {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(core, &cpuset);
     int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
     if (rc != 0) {
-        std::fprintf(stderr, "g: failed to pin thread to core %d (rc=%d)\n", core, rc);
+        std::fprintf(stderr, "failed to pin thread to core %d (rc=%d)\n", core, rc);
     }
 }
 
@@ -107,149 +95,20 @@ int open_raw_socket(const char* ifname) {
     return sock;
 }
 
-struct Pipeline {
-    spsc_ring<Packet*, kPoolSize> rx_ring;
-    spsc_ring<Packet*, kPoolSize> free_ring;
-    std::vector<Packet> storage{kPoolSize};
-};
+template <rx_mode Mode>
+void run(int sock, socket_pipeline& pipeline, std::vector<uint64_t>& latencies_ns,
+         uint64_t warmup, uint64_t iterations) {
+    using recorder = latency_recorder<Packet*>;
+    socket_receiver<Mode> rx(sock, pipeline);
+    socket_consumer<Mode, recorder> cx(pipeline, recorder{&latencies_ns, warmup});
 
-void receive_loop(int sock, Pipeline* p, uint64_t numIterations) {
+    std::thread consumer([&] {
+        pin_self_to_core(1);
+        cx.run(iterations);
+    });
     pin_self_to_core(0);
-    uint64_t processed = 0;
-
-    Packet* batch[kBurstSize];
-    struct mmsghdr msgs[kBurstSize];
-    struct iovec iovecs[kBurstSize];
-
-    uint64_t n_histogram[kBurstSize + 1] = {};
-    uint64_t recvmmsg_calls = 0;
-    std::size_t max_rx_ring_occupancy = 0;
-
-    while (processed < numIterations) {
-        std::size_t got = p->free_ring.try_pop_batch(std::span(batch, kRecvVlen));
-        if (got == 0) {
-            std::this_thread::yield();
-            continue;
-        }
-
-        std::memset(msgs, 0, got * sizeof(msgs[0]));
-        for (std::size_t i = 0; i < got; i++) {
-            iovecs[i].iov_base = batch[i]->data;
-            iovecs[i].iov_len = kMaxFrameSize;
-            msgs[i].msg_hdr.msg_iov = &iovecs[i];
-            msgs[i].msg_hdr.msg_iovlen = 1;
-        }
-
-        int n = recvmmsg(sock, msgs, static_cast<unsigned int>(got), MSG_WAITFORONE, nullptr);
-        if (n <= 0) {
-            std::size_t returned = 0;
-            while (returned < got) {
-                returned += p->free_ring.try_push_batch(std::span(batch).subspan(returned, got - returned));
-            }
-            continue;
-        }
-
-        recvmmsg_calls++;
-        n_histogram[n]++;
-
-        uint64_t ts = now_ns();
-        for (int i = 0; i < n; i++) {
-            batch[i]->ts = ts;
-            batch[i]->len = static_cast<uint16_t>(msgs[i].msg_len);
-        }
-        std::size_t pushed = 0;
-        std::size_t n_unsigned = static_cast<std::size_t>(n);
-        while (pushed < n_unsigned) {
-            pushed += p->rx_ring.try_push_batch(std::span(batch).subspan(pushed, n_unsigned - pushed));
-        }
-        max_rx_ring_occupancy = std::max(max_rx_ring_occupancy, p->rx_ring.size());
-        if (n_unsigned < got) {
-            std::size_t leftover = got - n_unsigned;
-            std::size_t returned = 0;
-            while (returned < leftover) {
-                returned += p->free_ring.try_push_batch(std::span(batch).subspan(n_unsigned + returned, leftover - returned));
-            }
-        }
-        processed += static_cast<uint64_t>(n);
-    }
-
-    std::printf("N_DIST calls=%lu", recvmmsg_calls);
-    for (std::size_t i = 1; i <= kBurstSize; i++) {
-        if (n_histogram[i] > 0) {
-            std::printf(" n%zu=%lu", i, n_histogram[i]);
-        }
-    }
-    std::printf("\n");
-    std::printf("RING_STATS max_rx_ring_occupancy=%zu capacity=%zu\n", max_rx_ring_occupancy, p->rx_ring.capacity());
-}
-
-void receive_loop_single(int sock, Pipeline* p, uint64_t numIterations) {
-    pin_self_to_core(0);
-    uint64_t processed = 0;
-    std::size_t max_rx_ring_occupancy = 0;
-    while (processed < numIterations) {
-        Packet* pkt;
-        while (!p->free_ring.try_pop(pkt)) {
-            std::this_thread::yield();
-        }
-        ssize_t n = recv(sock, pkt->data, kMaxFrameSize, 0);
-        if (n <= 0) {
-            while (!p->free_ring.try_push(pkt)) {
-            }
-            continue;
-        }
-        pkt->ts = now_ns();
-        pkt->len = static_cast<uint16_t>(n);
-        while (!p->rx_ring.try_push(pkt)) {
-            std::this_thread::yield();
-        }
-        max_rx_ring_occupancy = std::max(max_rx_ring_occupancy, p->rx_ring.size());
-        processed++;
-    }
-    std::printf("RING_STATS max_rx_ring_occupancy=%zu capacity=%zu\n", max_rx_ring_occupancy, p->rx_ring.capacity());
-}
-
-void consume_loop(Pipeline* p, std::vector<uint64_t>* latencies_ns, uint64_t numIterations,
-                   uint64_t warmupIterations) {
-    pin_self_to_core(1);
-    uint64_t processed = 0;
-    while (processed < numIterations) {
-        Packet* pkt;
-        while (!p->rx_ring.try_pop(pkt)) {
-            std::this_thread::yield();
-        }
-        uint64_t end_time = now_ns();
-        if (processed >= warmupIterations) {
-            (*latencies_ns)[processed - warmupIterations] = end_time - pkt->ts;
-        }
-        while (!p->free_ring.try_push(pkt)) {
-        }
-        processed++;
-    }
-}
-
-void consume_loop_batch(Pipeline* p, std::vector<uint64_t>* latencies_ns, uint64_t numIterations,
-                         uint64_t warmupIterations) {
-    pin_self_to_core(1);
-    uint64_t processed = 0;
-    Packet* batch[kBurstSize];
-    while (processed < numIterations) {
-        std::size_t popped = p->rx_ring.try_pop_batch(std::span(batch, kBurstSize));
-        if (popped == 0) {
-            std::this_thread::yield();
-            continue;
-        }
-        uint64_t end_time = now_ns();
-        for (std::size_t i = 0; i < popped && processed < numIterations; i++, processed++) {
-            if (processed >= warmupIterations) {
-                (*latencies_ns)[processed - warmupIterations] = end_time - batch[i]->ts;
-            }
-        }
-        std::size_t pushed = 0;
-        while (pushed < popped) {
-            pushed += p->free_ring.try_push_batch(std::span(batch).subspan(pushed, popped - pushed));
-        }
-    }
+    rx.run(iterations);
+    consumer.join();
 }
 
 }  // namespace
@@ -270,24 +129,24 @@ int main(int argc, char** argv) {
 
     int sock = open_raw_socket(ifname);
 
-    auto pipeline = std::make_unique<Pipeline>();
+    // ~8 MB of packet storage, so it lives on the heap. Every packet starts
+    // out free; the receiver pops from free_ring, the consumer pushes back.
+    auto pipeline = std::make_unique<socket_pipeline>();
     for (auto& pkt : pipeline->storage) {
         while (!pipeline->free_ring.try_push(&pkt)) {
         }
     }
 
-    std::vector<uint64_t> latencies_ns(numIterations - warmupIterations);
+    std::vector<uint64_t> latencies_ns;
+    latencies_ns.resize(numIterations - warmupIterations);
+    latencies_ns.clear();
 
     uint64_t run_start = now_ns();
-    std::thread consumer;
     if (mode == "single") {
-        consumer = std::thread(consume_loop, pipeline.get(), &latencies_ns, numIterations, warmupIterations);
-        receive_loop_single(sock, pipeline.get(), numIterations);
+        run<rx_mode::single>(sock, *pipeline, latencies_ns, warmupIterations, numIterations);
     } else {
-        consumer = std::thread(consume_loop_batch, pipeline.get(), &latencies_ns, numIterations, warmupIterations);
-        receive_loop(sock, pipeline.get(), numIterations);
+        run<rx_mode::batch>(sock, *pipeline, latencies_ns, warmupIterations, numIterations);
     }
-    consumer.join();
     uint64_t run_end = now_ns();
     std::printf("RUN_DURATION ns=%lu seconds=%.3f\n", run_end - run_start, (run_end - run_start) / 1e9);
 

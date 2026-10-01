@@ -31,7 +31,7 @@ class socket_receiver
     static constexpr std::size_t kBurst = burst_for(Mode, kSocketBurst);
     using mode_state = std::conditional_t<Mode == rx_mode::batch, socket_batch_state, socket_single_state>;
 public:
-    socket_receiver(int fd, socket_pipeline& pipeline);
+    socket_receiver(int fd, socket_pipeline& pipeline) : fd_(fd), pipeline_(pipeline) {}
 
 private:
     std::size_t acquire(std::span<Packet*> out) {
@@ -63,8 +63,11 @@ private:
         }
     }
     void release(std::span<Packet*> bufs) {
-        std::copy(bufs.begin(), bufs.end(), spare_);
-        spare_count_ = bufs.size();
+        // bufs.size() <= kBurst always holds; the min only lets GCC prove it
+        // (otherwise -Wstringop-overread fires for the single-mode instantiation).
+        const std::size_t n = std::min(bufs.size(), kBurst);
+        std::copy_n(bufs.begin(), n, spare_);
+        spare_count_ = n;
     }
     void stamp(std::span<Packet*> bufs) {
         uint64_t ts = now_ns();
@@ -78,6 +81,7 @@ private:
         while (pushed < n_unsigned) {
             pushed += pipeline_.rx_ring.try_push_batch(bufs.subspan(pushed, n_unsigned - pushed));
         }
+        max_rx_ring_occupancy_ = std::max(max_rx_ring_occupancy_, pipeline_.rx_ring.size());
     }
     void idle() {
         std::this_thread::yield();
@@ -101,12 +105,13 @@ private:
             }
             std::printf("\n");
         }
+        std::printf("RING_STATS max_rx_ring_occupancy=%zu capacity=%zu\n",
+                    max_rx_ring_occupancy_, pipeline_.rx_ring.capacity());
     }
 
     int fd_;
     socket_pipeline& pipeline_;
     std::size_t max_rx_ring_occupancy_ = 0;
-    uint16_t last_len_ = 0;
     [[no_unique_address]] mode_state state_;
     Packet* spare_[kBurst];
     std::size_t spare_count_ = 0;
