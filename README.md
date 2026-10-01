@@ -6,7 +6,10 @@
 We are using two QEMU virtual machines to benchmark the pipeline. The first virtual machine is running PKTGEN and is writing packets
 to the MAC address of the second VM. The second VM has two threads running where one thread is constantly consuming from the NIC and
 pushing those packets read straight to the SPSC queue. The other thread then pops from the SPSC queue and reads the start time from
-those packets to get the latency from getting the packet on the NIC to popping it from the queue and the data being usable. We use rdtsc
+those packets to get the **receive-to-consumer handoff latency**: the time from the receive call returning the packet (the receive thread
+stamps it right after `rte_eth_rx_burst`/`recv`/`recvmmsg` returns) to the consumer popping it from the queue and the data being usable.
+Note this window starts *after* the receive call, so the kernel's own receive work (syscall, copy, wakeup) happens before the stamp and is
+not part of the latency numbers (see [What the latency numbers do and don't show](#what-the-latency-numbers-do-and-dont-show)). We use rdtsc
 counter to see how many CPU cycles it takes for the DPDK path. The socket implemenations call clock_gettime(CLOCK_MONOTONIC_RAW) directly. 
 By taking the inverse of the counters frequency we get the time taken in seconds per cycle.
 Multiplying this by 1e9 gives us the time taken in ns. There are three pipelines we are comparing. 
@@ -21,9 +24,10 @@ reads in bursts. We then push and pop these bursts from the SPSC ring using its 
 ## Benchmark Results
 ![Latencies compared across all three pipelines](analysis/latency_comparison.png)
 ## Analysis
-We can see here that the DPDK-based implementation clearly has the best p50 latency and tail latency. This is primarily becuause
-the DPDK kernel bypass removes the overhead of the call going through the kernel stack. Meaning that when we use recv or recvmmsg
-we must do the following steps:
+We can see here that the DPDK-based implementation clearly has the best p50 latency and tail latency, and it is the only path that
+delivered every offered packet (0% dropped vs. 39–45% for the socket paths). The drop rate and throughput gap is where the kernel bypass
+shows up directly: every packet the socket path receives has to go through the kernel stack, which caps how fast it can drain the NIC.
+When we use recv or recvmmsg we must do the following steps per call:
 1. Switch from userspace to kernel space
 2. Kernel grabs file-descriptor for the socket from process file-descriptor table
 3. Socket buffer is locked so not corrupted during read
@@ -39,10 +43,19 @@ If the buffer is empty after step 3 **additionally**:
 We are able to skip this using DPDK. The NIC driver is running in userspace using vfio, and the packets are transferred from the NIC via direct memory access (DMA) into the 
 ring of descriptors fed into the queue created with rte_eth_rx_queue_setup. When we call rte_eth_rx_burst() we aren't performing a syscall, it just reads the descriptor rings
 that have already been written by the NIC. We are skipping the interrupt, context switch, copy, and thread descheduling (while waiting for something to come).
-This explains why DPDK is so awesome here. There is an inherent tradeoff we see between the recv()/recvmmsg() implementations. They either have a low discovery latency, but
+This is why DPDK keeps up with the offered load when the sockets can't. There is an inherent tradeoff we see between the recv()/recvmmsg() implementations. They either have a low discovery latency, but
 have to pay the cost of the syscall each time OR have less syscalls via batching with the con of earlier packets in each batch being stale. rte_eth_rx_burst doesn't have this
 cost to deal with; So it can read from the nic constantly in a busy poll loop to get fast discovery latency, while also picking up many packets per call. It doesn't have to 
 choose one.
+
+### What the latency numbers do and don't show
+The kernel steps above happen *before* the receive thread stamps the packet, so they are not inside the measured latency window.
+The latency gap between DPDK and the sockets (140ns vs ~780ns p50) comes from what happens after the receive call: the hand-off through
+the ring and the consumer picking the packet up. Likely contributors are the socket consumer calling `std::this_thread::yield()` (a syscall)
+when the ring is empty while the DPDK consumer busy-spins with `rte_pause()`, the cost of `clock_gettime` vs `rdtsc`, and the kernel's
+packet processing competing with the consumer for one of the VM's two vCPUs. These haven't been separated out yet.
+To measure the kernel receive path itself, the next step is to stamp socket packets with the kernel's own receive timestamp
+(`SO_TIMESTAMPNS`) instead of stamping after `recv()` returns, so the measured window includes the syscall, copy and wakeup.
 
 ### Packet Loss
 Now when we compare the two socket based implementation's we have to note something interesting. When I first ran the numbers with
