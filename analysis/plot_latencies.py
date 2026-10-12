@@ -3,12 +3,14 @@
 each backed by several repeated runs (see scripts/run_repeated.sh).
 
 Usage:
-    python3 plot_latencies.py
+    python3 plot_latencies.py [scenario_dir] [output.png]
+
+Defaults to runs/baseline and latency_comparison.png.
 
 Expects a directory per configuration, each containing one CSV per run:
-    runs/rx_bench/*.csv           -> "DPDK (rx_bench)"
-    runs/socket_single/*.csv      -> "Socket, single recv()"
-    runs/socket_batch/*.csv       -> "Socket, recvmmsg batch"
+    runs/baseline/dpdk/*.csv           -> "DPDK (rx_bench)"
+    runs/baseline/socket_single/*.csv  -> "Socket, single recv()"
+    runs/baseline/socket_batch/*.csv   -> "Socket, recvmmsg batch"
 
 All runs within a directory are pooled for the histogram/CDF (a larger
 sample count gives a more stable tail-percentile estimate). Per-run p99.9
@@ -26,10 +28,15 @@ matplotlib.use("Agg")
 import numpy as np
 import matplotlib.pyplot as plt
 
+import sys
+
+SCENARIO = sys.argv[1] if len(sys.argv) > 1 else "runs/baseline"
+OUTPUT = sys.argv[2] if len(sys.argv) > 2 else "latency_comparison.png"
+
 CANDIDATES = [
-    ("runs/rx_bench", "DPDK (rx_bench)", "tab:blue"),
-    ("runs/socket_single", "Socket, single recv()", "tab:orange"),
-    ("runs/socket_batch", "Socket, recvmmsg batch", "tab:green"),
+    (f"{SCENARIO}/dpdk", "DPDK (rx_bench)", "tab:blue"),
+    (f"{SCENARIO}/socket_single", "Socket, single recv()", "tab:orange"),
+    (f"{SCENARIO}/socket_batch", "Socket, recvmmsg batch", "tab:green"),
 ]
 
 
@@ -166,8 +173,8 @@ def main():
         fontsize=8,
         family="monospace",
     )
-    fig.savefig("latency_comparison.png", dpi=150)
-    print("Saved latency_comparison.png")
+    fig.savefig(OUTPUT, dpi=150)
+    print(f"Saved {OUTPUT}")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <ctime>
 #include <span>
 #include <thread>
 #include <type_traits>
@@ -15,13 +17,35 @@
 #include "hotpath/rx_mode.h"
 #include "hotpath/socket/socket_common.h"
 
+inline constexpr std::size_t kTsCtrlSize = CMSG_SPACE(sizeof(timespec));
+
+struct ts_ctrl {
+    alignas(cmsghdr) unsigned char buf[kTsCtrlSize];
+};
+
+inline uint64_t kernel_rx_ts(msghdr& hdr) {
+    for (cmsghdr* c = CMSG_FIRSTHDR(&hdr); c != nullptr; c = CMSG_NXTHDR(&hdr, c)) {
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_TIMESTAMPNS) {
+            timespec ts;
+            std::memcpy(&ts, CMSG_DATA(c), sizeof(ts));
+            return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ull + static_cast<uint64_t>(ts.tv_nsec);
+        }
+    }
+    return 0;
+}
+
 struct socket_batch_state {
     mmsghdr msgs[kSocketBurst] = {};
     iovec iovecs[kSocketBurst] = {};
+    ts_ctrl ctrls[kSocketBurst] = {};
     uint64_t n_histogram[kSocketBurst + 1] = {};
     uint64_t recvmmsg_calls = 0;
 };
-struct socket_single_state {};
+struct socket_single_state {
+    msghdr hdr = {};
+    iovec iov = {};
+    ts_ctrl ctrl = {};
+};
 
 template <rx_mode Mode>
 class socket_receiver
@@ -42,14 +66,18 @@ private:
     }
     std::size_t receive(std::span<Packet*> bufs) {
         if constexpr (Mode == rx_mode::single) {
-            ssize_t n = recv(fd_, bufs[0]->data, kMaxFrameSize, 0);
+            state_.iov.iov_base = bufs[0]->data;
+            state_.hdr.msg_controllen = kTsCtrlSize;
+            ssize_t n = recvmsg(fd_, &state_.hdr, 0);
             if (n <= 0)
                 return 0;
             bufs[0]->len = static_cast<uint16_t>(n);
+            bufs[0]->ts = rx_ts(state_.hdr);
             return 1;
         } else {
             for (std::size_t i = 0; i < bufs.size(); i++) {
                 state_.iovecs[i].iov_base = bufs[i]->data;
+                state_.msgs[i].msg_hdr.msg_controllen = kTsCtrlSize;
             }
             int n = recvmmsg(fd_, state_.msgs, static_cast<unsigned int>(bufs.size()), MSG_WAITFORONE, nullptr);
             if (n <= 0)
@@ -58,6 +86,7 @@ private:
             ++state_.n_histogram[n];
             for (int i = 0; i < n; i++) {
                 bufs[i]->len = static_cast<uint16_t>(state_.msgs[i].msg_len);
+                bufs[i]->ts = rx_ts(state_.msgs[i].msg_hdr);
             }
             return n;
         }
@@ -69,11 +98,13 @@ private:
         std::copy_n(bufs.begin(), n, spare_);
         spare_count_ = n;
     }
-    void stamp(std::span<Packet*> bufs) {
-        uint64_t ts = now_ns();
-        for (Packet* buf : bufs) {
-            buf->ts = ts;
-        }
+    void stamp(std::span<Packet*>) {}
+    uint64_t rx_ts(msghdr& hdr) {
+        const uint64_t ts = kernel_rx_ts(hdr);
+        if (ts != 0)
+            return ts;
+        ++missing_ts_;
+        return now_ns();
     }
     void publish(std::span<Packet*> bufs) {
         std::size_t pushed = 0;
@@ -87,11 +118,21 @@ private:
         std::this_thread::yield();
     }
     void on_start() {
-        if constexpr (Mode == rx_mode::batch) {
+        int one = 1;
+        if (setsockopt(fd_, SOL_SOCKET, SO_TIMESTAMPNS, &one, sizeof(one)) < 0) {
+            std::perror("setsockopt(SO_TIMESTAMPNS)");
+        }
+        if constexpr (Mode == rx_mode::single) {
+            state_.iov.iov_len = kMaxFrameSize;
+            state_.hdr.msg_iov = &state_.iov;
+            state_.hdr.msg_iovlen = 1;
+            state_.hdr.msg_control = state_.ctrl.buf;
+        } else {
             for (std::size_t i = 0; i < kSocketBurst; i++) {
                 state_.iovecs[i].iov_len = kMaxFrameSize;
                 state_.msgs[i].msg_hdr.msg_iovlen = 1;
                 state_.msgs[i].msg_hdr.msg_iov = &state_.iovecs[i];
+                state_.msgs[i].msg_hdr.msg_control = state_.ctrls[i].buf;
             }
         }
     }
@@ -107,6 +148,7 @@ private:
         }
         std::printf("RING_STATS max_rx_ring_occupancy=%zu capacity=%zu\n",
                     max_rx_ring_occupancy_, pipeline_.rx_ring.capacity());
+        std::printf("TS_STATS source=SO_TIMESTAMPNS missing=%lu\n", missing_ts_);
     }
 
     int fd_;
@@ -115,6 +157,7 @@ private:
     [[no_unique_address]] mode_state state_;
     Packet* spare_[kBurst];
     std::size_t spare_count_ = 0;
+    uint64_t missing_ts_ = 0;
 };
 
 #endif //HOTPATH_SOCKET_RECEIVER_H

@@ -1,18 +1,31 @@
 # hotpath
 
 ## Overview
+hotpath is a header-only C++ library for low-latency packet receive. It compares three ways of getting packets from a NIC into
+an application: DPDK kernel bypass, Linux `recv()`, and batched `recvmmsg()`. In each case a receive thread hands packets to a
+consumer core through a lock-free SPSC ring buffer. The backends share one receive/consume loop built with CRTP, and the
+single vs. batch socket mode is chosen at compile time.
+
+At identical load, DPDK delivers a packet to the consumer in 130 ns at p50, against about 4.8 µs for the socket path measured from
+the kernel's own receive timestamp. Under full load DPDK drops nothing while the socket path falls behind and drops packets.
 
 ## Benchmark
 We are using two QEMU virtual machines to benchmark the pipeline. The first virtual machine is running PKTGEN and is writing packets
 to the MAC address of the second VM. The second VM has two threads running where one thread is constantly consuming from the NIC and
 pushing those packets read straight to the SPSC queue. The other thread then pops from the SPSC queue and reads the start time from
-those packets to get the **receive-to-consumer handoff latency**: the time from the receive call returning the packet (the receive thread
-stamps it right after `rte_eth_rx_burst`/`recv`/`recvmmsg` returns) to the consumer popping it from the queue and the data being usable.
-Note this window starts *after* the receive call, so the kernel's own receive work (syscall, copy, wakeup) happens before the stamp and is
-not part of the latency numbers (see [What the latency numbers do and don't show](#what-the-latency-numbers-do-and-dont-show)). We use rdtsc
-counter to see how many CPU cycles it takes for the DPDK path. The socket implemenations call clock_gettime(CLOCK_MONOTONIC_RAW) directly. 
-By taking the inverse of the counters frequency we get the time taken in seconds per cycle.
-Multiplying this by 1e9 gives us the time taken in ns. There are three pipelines we are comparing. 
+those packets to get the latency from the packet first being seen by software to the consumer popping it from the queue and the data being usable.
+Where that start time is taken depends on the path:
+- **DPDK:** the receive thread stamps packets with the rdtsc counter right after `rte_eth_rx_burst` returns. With busy polling this is the
+earliest point software sees the packet (virtio has no hardware timestamps). By taking the inverse of the counter's frequency we get the
+time taken in seconds per cycle, and multiplying this by 1e9 gives us the time taken in ns.
+- **Sockets:** the kernel stamps each packet when it enters the network stack (`SO_TIMESTAMPNS`), and the receive thread reads that
+timestamp back from `recvmsg`/`recvmmsg`. The measured window therefore includes the whole kernel receive path: waiting in the socket
+buffer, waking the receive thread, copying the data and returning from the syscall. The consumer reads `clock_gettime(CLOCK_REALTIME)`,
+the same clock the kernel timestamp uses.
+
+The plot under [Benchmark Results](#benchmark-results) was recorded with an earlier version that stamped socket packets after
+`recv`/`recvmmsg` returned. The kernel-timestamp results are in [Measuring the kernel receive path](#measuring-the-kernel-receive-path).
+All raw data is in [analysis/runs](analysis/runs/README.md). There are three pipelines we are comparing. 
 - The one we expect to perform the best is the DPDK kernel bypass pipeline that uses a busy polling approach to read from the NIC. It is using rte_eth_rx_burst to read batches/bursts
 of packets from the NIC. These are then pushed as a batch to the SPSC ring and popped from the ring as a batch.
 - The next is a simple socket based approach, that uses the recv system function to read from the socket. The single version of this
@@ -48,14 +61,49 @@ have to pay the cost of the syscall each time OR have less syscalls via batching
 cost to deal with; So it can read from the nic constantly in a busy poll loop to get fast discovery latency, while also picking up many packets per call. It doesn't have to 
 choose one.
 
-### What the latency numbers do and don't show
-The kernel steps above happen *before* the receive thread stamps the packet, so they are not inside the measured latency window.
-The latency gap between DPDK and the sockets (140ns vs ~780ns p50) comes from what happens after the receive call: the hand-off through
-the ring and the consumer picking the packet up. Likely contributors are the socket consumer calling `std::this_thread::yield()` (a syscall)
-when the ring is empty while the DPDK consumer busy-spins with `rte_pause()`, the cost of `clock_gettime` vs `rdtsc`, and the kernel's
-packet processing competing with the consumer for one of the VM's two vCPUs. These haven't been separated out yet.
-To measure the kernel receive path itself, the next step is to stamp socket packets with the kernel's own receive timestamp
-(`SO_TIMESTAMPNS`) instead of stamping after `recv()` returns, so the measured window includes the syscall, copy and wakeup.
+### Measuring the kernel receive path
+The first version of the benchmark (the plot above) stamped socket packets after `recv`/`recvmmsg` returned, so the kernel steps above
+happened before the clock started. That version only measured the hand-off through the ring to the consumer (140ns vs ~780ns p50).
+The socket path now uses the kernel's own receive timestamp (`SO_TIMESTAMPNS`). The kernel records the time when the packet enters the
+network stack and hands it back alongside the packet, so the socket numbers below include every kernel step listed above.
+
+The start points are as close as each path allows, but they aren't identical. Neither includes time the packet spends in the virtio
+receive ring before software picks it up. The kernel stamp is taken after the interrupt has been delivered and packet processing has
+started, so interrupt delivery, which DPDK avoids entirely, is still outside the socket window. If anything, the socket numbers understate
+the full cost of the socket path.
+
+**Same traffic for both paths** (Pktgen at 0.1% rate, burst 1, so packets arrive one at a time. 10 runs of 95,000 samples each, pooled):
+
+| Path | p50 | p99 | p99.9 | Dropped |
+|---|---|---|---|---|
+| DPDK | 130 ns | 210 ns | 1.28 µs | 0% |
+| Socket, single `recvmsg()` | 4.83 µs | 9.34 µs | 19.4 µs | 0% |
+| Socket, `recvmmsg` batch | 5.18 µs | 10.0 µs | 19.9 µs | 0% |
+
+![DPDK vs sockets at identical load, kernel timestamps](analysis/latency_kernel_ts_0.1pct_burst1.png)
+
+At identical load DPDK is about 37x faster at p50 and 44x faster at p99 than the best socket path. Getting one packet through the
+kernel and waking the thread blocked in `recvmsg` (which in a VM also means the hypervisor rescheduling that vCPU) costs about 4.8 µs.
+The batch path is about 350 ns slower when only one packet is waiting: `recvmmsg` still resets its 32 message headers and checks for
+more packets after the first one arrives, which is batching overhead with nothing to batch.
+
+**Higher load:**
+- At 1% rate with Pktgen's default burst of 32, socket p50 rose to about 40 µs (39.8 µs single, 42.4 µs batch) with 0 drops. `N_DIST`
+shows packets arriving 32 at a time, so each one waits behind the rest of its burst. Both the rate and the burst size changed between
+this run and the one above, so the increase can't be pinned on one of them alone.
+- At full rate the socket path can't keep up: it drops 36–43% of packets, and the packets that do get through wait 69 ms (batch) and
+113 ms (single) at p50. That is time spent queued in the 8 MB receive buffer from the [Packet Loss](#packet-loss) section. Latency
+multiplied by drain rate comes to about 16k packets queued ahead of each one in both modes, roughly what 8 MB holds. Raising
+`SO_RCVBUFFORCE` cut drops by 7–8 points but added tens of milliseconds of queueing delay. DPDK at full rate drops nothing and stays at
+140 ns p50 / 290 ns p99.
+
+The kernel timestamp is in `CLOCK_REALTIME`, so the consumer reads the same clock. Unlike `CLOCK_MONOTONIC_RAW`, `CLOCK_REALTIME` can be
+stepped by NTP mid-run, which would corrupt the samples it lands on. To rule that out, time sync is disabled on the receiving VM for the
+duration of the runs:
+```bash
+sudo timedatectl set-ntp false   # before benchmarking
+sudo timedatectl set-ntp true    # after
+```
 
 ### Packet Loss
 Now when we compare the two socket based implementation's we have to note something interesting. When I first ran the numbers with
