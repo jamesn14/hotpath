@@ -153,7 +153,8 @@ int main(int argc, char** argv) {
     struct tpacket_stats pkt_stats {};
     socklen_t stats_len = sizeof(pkt_stats);
     if (getsockopt(sock, SOL_PACKET, PACKET_STATISTICS, &pkt_stats, &stats_len) == 0) {
-        std::printf("DROP_STATS received=%u dropped=%u\n", pkt_stats.tp_packets, pkt_stats.tp_drops);
+        std::printf("DROP_STATS offered=%u delivered=%u dropped=%u\n", pkt_stats.tp_packets,
+                    pkt_stats.tp_packets - pkt_stats.tp_drops, pkt_stats.tp_drops);
     } else {
         perror("getsockopt(PACKET_STATISTICS)");
     }

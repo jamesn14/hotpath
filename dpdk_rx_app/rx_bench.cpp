@@ -95,8 +95,9 @@ int main(int argc, char** argv) {
 
     struct rte_eth_stats stats;
     rte_eth_stats_get(0, &stats);
-    std::printf("DROP_STATS received=%lu dropped=%lu (imissed=%lu rx_nombuf=%lu ierrors=%lu)\n",
-                stats.ipackets, stats.imissed + stats.rx_nombuf, stats.imissed, stats.rx_nombuf, stats.ierrors);
+    const uint64_t dropped = stats.imissed + stats.rx_nombuf;
+    std::printf("DROP_STATS offered=%lu delivered=%lu dropped=%lu (imissed=%lu rx_nombuf=%lu ierrors=%lu)\n",
+                stats.ipackets + dropped, stats.ipackets, dropped, stats.imissed, stats.rx_nombuf, stats.ierrors);
 
     print_percentiles("rx_bench round-trip", cycles, ns_per_cycle);
     export_csv("rx_bench_latencies.csv", cycles, ns_per_cycle);

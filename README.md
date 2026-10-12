@@ -38,7 +38,7 @@ reads in bursts. We then push and pop these bursts from the SPSC ring using its 
 ![Latencies compared across all three pipelines](analysis/latency_comparison.png)
 ## Analysis
 We can see here that the DPDK-based implementation clearly has the best p50 latency and tail latency, and it is the only path that
-delivered every offered packet (0% dropped vs. 39–45% for the socket paths). The drop rate and throughput gap is where the kernel bypass
+delivered every offered packet (0% dropped vs. 64–82% for the socket paths). The drop rate and throughput gap is where the kernel bypass
 shows up directly: every packet the socket path receives has to go through the kernel stack, which caps how fast it can drain the NIC.
 When we use recv or recvmmsg we must do the following steps per call:
 1. Switch from userspace to kernel space
@@ -91,10 +91,10 @@ more packets after the first one arrives, which is batching overhead with nothin
 - At 1% rate with Pktgen's default burst of 32, socket p50 rose to about 40 µs (39.8 µs single, 42.4 µs batch) with 0 drops. `N_DIST`
 shows packets arriving 32 at a time, so each one waits behind the rest of its burst. Both the rate and the burst size changed between
 this run and the one above, so the increase can't be pinned on one of them alone.
-- At full rate the socket path can't keep up: it drops 36–43% of packets, and the packets that do get through wait 69 ms (batch) and
+- At full rate the socket path can't keep up: it drops 58–75% of packets, and the packets that do get through wait 69 ms (batch) and
 113 ms (single) at p50. That is time spent queued in the 8 MB receive buffer from the [Packet Loss](#packet-loss) section. Latency
 multiplied by drain rate comes to about 16k packets queued ahead of each one in both modes, roughly what 8 MB holds. Raising
-`SO_RCVBUFFORCE` cut drops by 7–8 points but added tens of milliseconds of queueing delay. DPDK at full rate drops nothing and stays at
+`SO_RCVBUFFORCE` cut drops by about 20 points but added tens of milliseconds of queueing delay. DPDK at full rate drops nothing and stays at
 140 ns p50 / 290 ns p99.
 
 The kernel timestamp is in `CLOCK_REALTIME`, so the consumer reads the same clock. Unlike `CLOCK_MONOTONIC_RAW`, `CLOCK_REALTIME` can be
@@ -110,30 +110,36 @@ Now when we compare the two socket based implementation's we have to note someth
 the recvmmsg implementation of the socket, I was disappointed. It consistently lagged behind the single packet recv implementation in terms
 of latency, ie ~100ns on the p50. I was concerned that the batch implementation wasn't showing up as faster because there wasn't enough
 traffic reach the VM (wasn't sure if there was some bottleneck somewhere between the two VM's I wasn't aware of). To fix this, I logged the packets dropped
-and found that actually we were dropping around 44% of our packets. This means the problem with our batch wasn't that we weren't getting enough packets.
+and found that actually we were dropping around 78% of our packets. This means the problem with our batch wasn't that we weren't getting enough packets.
 What I first did to lower the amount of packets being dropped, was set the SO_RCVBUFFORCE linux socket option to 8MB, so the socket is allowed to have more
-data pile up before its dropped. This succeeded in slightly reducing the percentage dropped 7-8%. When we account for the packets dropped for the single recv socket
-numbers we get a different story between the two implementations.
+data pile up before its dropped. This reduced the percentage dropped from about 78% to about 58%. When we account for the packets dropped for the single recv socket
+numbers we get a different story between the two implementations: across the 10 baseline runs, single `recv()` dropped 81.5% of offered packets
+and `recvmmsg` batch dropped 63.6%, so the single-packet latencies only describe the fastest-handled 18.5% of the traffic.
+
+The kernel's packet counter (`tp_packets` from `PACKET_STATISTICS`) already includes the dropped packets, so the drop rate is
+`dropped / offered`. An earlier version of this README added the drops to that counter a second time, which made every drop rate look
+lower (44% here instead of 78%). You can see the counter includes drops from the numbers themselves: offered minus dropped comes out to
+the ~100k packets each run processed (plus ~17k still sitting in the 8MB buffer in the "After" runs).
 
 **Batched Packet Loss**
 
-| Period | Received | Dropped  | Percent Dropped (of received + dropped) |
-|---|---|----------|-----------------------------------------|
-| Before 1 | 491,120 | 390,891  | 44.3%                                   |
-| Before 2 | 423,800 | 323,572  | 43.3%                                   |
-| Before 3 | 480,754 | 380,531  | 44.2%                                   | 
-| Before Avg | — | —  | ~43.9%                                  | 
-| After 1 | 304,889 | 187,412  | 38.1%                                   | 
-| After 2 | 301,312 | 183,835  | 37.9%                                   |
-| After 3 | 243,189 | 125,712  | 34.1%                                   | 
-| After Avg | — | — | ~36.7%                                  |  
+| Period | Offered (`tp_packets`) | Dropped  | Percent Dropped (dropped / offered) |
+|---|---|----------|-------------------------------------|
+| Before 1 | 491,120 | 390,891  | 79.6%                               |
+| Before 2 | 423,800 | 323,572  | 76.4%                               |
+| Before 3 | 480,754 | 380,531  | 79.2%                               | 
+| Before Avg | — | —  | ~78.4%                              | 
+| After 1 | 304,889 | 187,412  | 61.5%                               | 
+| After 2 | 301,312 | 183,835  | 61.0%                               |
+| After 3 | 243,189 | 125,712  | 51.7%                               | 
+| After Avg | — | — | ~58.1%                              |  
 
 ### recv() vs recvmmsg()
 What we see in these numbers from the latency by percentile is a couple of things:
 1. recv (single) sees more raw offered packets in absolute terms because it's throughput-limited (one packet per call), so it takes longer in total time to execute
 the 95,000 iteration run. This means over the duration of the run, more packets are seen and dropped.
-2. Of this greater number of packets sent during the run, the percentage dropped by the recv (single) is more still compared to recvmmsg (batch). We can see that 
-around 6% more were delivered by the recvmmsg runs.
+2. Of this greater number of packets sent during the run, the percentage dropped by the recv (single) is more still compared to recvmmsg (batch). The recvmmsg runs
+delivered 36.4% of offered packets against 18.5% for single recv, about twice the share.
 3. If we set vlen to 1 in the recvmmsg() parameters we get these numbers: \
 vlen=1 batch p50 values (10 runs): 780, 780, 790, 790, 780, 780, 790, 790, 780, 790 → average ≈ 785ns \
 vlen=1 batch p99 values: 1140, 1180, 1320, 1300, 1250, 1130, 1130, 1220, 1250, 1130 → average ≈ 1205ns \

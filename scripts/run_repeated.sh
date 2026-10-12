@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Run a benchmark binary N times, stashing each run's fixed-name output CSV
 # under a separate, numbered filename so results aren't overwritten. Also
-# captures each run's "DROP_STATS received=<n> dropped=<n>" line (emitted by
-# both socket_bench and rx_bench) into <output_dir>/drop_stats.csv.
+# captures each run's "DROP_STATS offered=<n> delivered=<n> dropped=<n>" line
+# (emitted by both socket_bench and rx_bench) into <output_dir>/drop_stats.csv.
 #
 # Usage:
 #   run_repeated.sh <num_runs> <csv_produced_by_binary> <output_dir> -- <command...>
@@ -37,7 +37,7 @@ summary="$outdir/summary.log"
 : > "$summary"
 
 drop_stats_csv="$outdir/drop_stats.csv"
-echo "run,received,dropped" > "$drop_stats_csv"
+echo "run,offered,dropped" > "$drop_stats_csv"
 
 for i in $(seq -w 1 "$num_runs"); do
     echo "=== run $i/$num_runs ===" | tee -a "$summary"
@@ -61,9 +61,9 @@ for i in $(seq -w 1 "$num_runs"); do
 
     if grep -q "DROP_STATS" <<< "$output"; then
         drop_line=$(grep "DROP_STATS" <<< "$output" | tail -1)
-        received=$(grep -oP 'received=\K[0-9]+' <<< "$drop_line")
+        offered=$(grep -oP 'offered=\K[0-9]+' <<< "$drop_line")
         dropped=$(grep -oP 'dropped=\K[0-9]+' <<< "$drop_line")
-        echo "$i,$received,$dropped" >> "$drop_stats_csv"
+        echo "$i,$offered,$dropped" >> "$drop_stats_csv"
     else
         echo "warning: no DROP_STATS line found in run $i output" >&2
     fi

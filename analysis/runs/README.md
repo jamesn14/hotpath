@@ -25,16 +25,19 @@ The kernel timestamp only applies to the socket path. DPDK's measurement is the 
 
 ## Pooled results (all 10 runs combined)
 
+Dropped is `dropped / offered`. In `drop_stats.csv` files written before the fix, the offered column is named `received`; for the
+socket runs it is the kernel's `tp_packets`, which already includes dropped packets.
+
 | Folder | Path | p50 | p99 | p99.9 | Dropped |
 |---|---|---|---|---|---|
 | `baseline` | DPDK | 140 ns | 290 ns | 5.05 µs | 0% |
-| | Socket single | 780 ns | 1.18 µs | 29.9 µs | 44.9% |
-| | Socket batch | 870 ns | 1.34 µs | 35.0 µs | 38.9% |
+| | Socket single | 780 ns | 1.18 µs | 29.9 µs | 81.5% |
+| | Socket batch | 870 ns | 1.34 µs | 35.0 µs | 63.6% |
 | `refactor_check` | DPDK | 140 ns | 290 ns | 4.43 µs | 0% |
-| | Socket single | 770 ns | 1.12 µs | 5.61 µs | 43.5% |
-| | Socket batch | 850 ns | 1.38 µs | 11.5 µs | 34.9% |
-| `kernel_ts_overload` | Socket single | 112.8 ms | 143.6 ms | 158.3 ms | 42.7% |
-| | Socket batch | 69.2 ms | 95.8 ms | 100.1 ms | 36.5% |
+| | Socket single | 770 ns | 1.12 µs | 5.61 µs | 77.0% |
+| | Socket batch | 850 ns | 1.38 µs | 11.5 µs | 53.6% |
+| `kernel_ts_overload` | Socket single | 112.8 ms | 143.6 ms | 158.3 ms | 74.5% |
+| | Socket batch | 69.2 ms | 95.8 ms | 100.1 ms | 57.6% |
 | `kernel_ts_1pct` | Socket single | 39.8 µs | 102.0 µs | 116.6 µs | 0% |
 | | Socket batch | 42.4 µs | 103.7 µs | 129.4 µs | 0% |
 | `kernel_ts_0.1pct_burst1` | DPDK | 130 ns | 210 ns | 1.28 µs | 0% |

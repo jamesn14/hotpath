@@ -53,31 +53,33 @@ def load_runs(dir_path):
 
 
 def load_drop_stats(dir_path):
-    """Sum received/dropped across runs from run_repeated.sh's drop_stats.csv.
+    """Sum offered/dropped across runs from run_repeated.sh's drop_stats.csv.
 
-    Returns (total_received, total_dropped), or None if not present.
+    Offered is the kernel's tp_packets (or DPDK ipackets + imissed + rx_nombuf),
+    which already includes dropped packets. Older files call this column
+    "received". Returns (total_offered, total_dropped), or None if not present.
     """
     path = os.path.join(dir_path, "drop_stats.csv")
     if not os.path.exists(path):
         return None
-    total_received = 0
+    total_offered = 0
     total_dropped = 0
     with open(path) as f:
         for row in csv.DictReader(f):
-            total_received += int(row["received"])
+            total_offered += int(row.get("offered", row.get("received")))
             total_dropped += int(row["dropped"])
-    if total_received + total_dropped == 0:
+    if total_offered == 0:
         return None
-    return total_received, total_dropped
+    return total_offered, total_dropped
 
 
 def format_percentiles(data, label, drop_stats=None):
     p50, p99, p999 = np.percentile(data, [50, 99, 99.9])
     line = f"{label}: p50={p50:,.0f}ns  p99={p99:,.0f}ns  p99.9={p999:,.0f}ns  (n={len(data):,})"
     if drop_stats is not None:
-        received, dropped = drop_stats
-        delivered_pct = 100.0 * received / (received + dropped)
-        line += f"  delivered={delivered_pct:.1f}% (of {received + dropped:,} offered)"
+        offered, dropped = drop_stats
+        delivered_pct = 100.0 * (offered - dropped) / offered
+        line += f"  delivered={delivered_pct:.1f}% (of {offered:,} offered)"
     return line
 
 
@@ -94,8 +96,8 @@ def main():
         configs.append((pooled, per_run_p999, label, color, drop_stats))
         print(f"{label}: {len(runs)} runs, {len(pooled):,} pooled samples", end="")
         if drop_stats is not None:
-            received, dropped = drop_stats
-            print(f", delivered={100.0 * received / (received + dropped):.1f}%")
+            offered, dropped = drop_stats
+            print(f", delivered={100.0 * (offered - dropped) / offered:.1f}%")
         else:
             print(" (no drop_stats.csv found)")
 
